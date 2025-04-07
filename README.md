@@ -1,2 +1,2 @@
-# rnnoise_gui
-Noise reduction tool using RNNoise and GTK
+# RNNoise Noise Remover
+Noise reduction tool using RNNoise and GTK.
