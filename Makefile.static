@@ -1,0 +1,22 @@
+CC = gcc
+CFLAGS = -I./rnnoise/src `pkg-config --cflags gtk+-3.0` -O3 -march=native -fPIC
+LDFLAGS = `pkg-config --libs gtk+-3.0` -lm -lrnnoise
+SOURCES = rnnoise_gui_static.c \
+          rnnoise/src/denoise.c \
+          rnnoise/src/rnn.c \
+          rnnoise/src/rnnoise_data.c \
+          rnnoise/src/celt_lpc.c \
+          rnnoise/src/pitch.c \
+          rnnoise/src/kiss_fft.c \
+          rnnoise/src/nnet.c \
+          rnnoise/src/nnet_default.c \
+          rnnoise/src/parse_lpcnet_weights.c \
+          rnnoise/src/rnnoise_tables.c
+
+all: rnnoise_gui_static
+
+rnnoise_gui_static: $(SOURCES)
+	$(CC) $(CFLAGS) -o $@ $(SOURCES) $(LDFLAGS)
+
+clean:
+	rm -f rnnoise_gui_static
