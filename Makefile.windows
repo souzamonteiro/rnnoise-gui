@@ -1,0 +1,17 @@
+# Makefile for Audio Recorder - MSYS2 + GTK 3.
+
+CC = gcc
+PKG = pkg-config
+CFLAGS = $(shell $(PKG) --cflags gtk+-3.0)
+LIBS = $(shell $(PKG) --libs gtk+-3.0)
+SRC = main.c
+OUT = audio_recorder.exe
+
+all: $(OUT)
+
+$(OUT): $(SRC)
+	$(CC) -o $(OUT) $(SRC) $(CFLAGS) $(LIBS)
+
+clean:
+	rm -f $(OUT)
+
