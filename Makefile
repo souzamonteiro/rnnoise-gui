@@ -1,4 +1,4 @@
-all: rnnoise_gui pcm_to_wav wav_to_pcm recorder audio_recorder rnnoise_audio_recorder
+all: rnnoise_gui pcm_to_wav wav_to_pcm recorder audio_recorder audio_denoiser
 
 rnnoise_gui: rnnoise_gui.c
 	gcc -o rnnoise_gui rnnoise_gui.c `pkg-config --cflags --libs gtk+-3.0` -lrnnoise
@@ -15,5 +15,8 @@ recorder: recorder.c
 audio_recorder: audio_recorder.c
 	gcc audio_recorder.c -o audio_recorder `pkg-config --cflags --libs gtk+-3.0` -lm -ldl -lpthread
 
+audio_denoiser: audio_denoiser.c
+	gcc audio_denoiser.c -o audio_denoiser `pkg-config --cflags --libs gtk+-3.0` -lm -ldl -lpthread -lrnnoise
+
 clean:
-	rm -f rnnoise_gui pcm_to_wav wav_to_pcm recorder audio_recorder
+	rm -f rnnoise_gui pcm_to_wav wav_to_pcm recorder audio_recorder audio_denoiser
