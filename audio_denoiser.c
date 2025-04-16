@@ -39,21 +39,48 @@ typedef struct {
     
     ma_context context;
     ma_device device;
-    DenoiseState *rnnoise_state;
-    gboolean is_processing;
     ma_device_info *playback_infos;
     ma_device_info *capture_infos;
     ma_uint32 playback_count;
     ma_uint32 capture_count;
+
+    DenoiseState *rnnoise_state;
+
+    gboolean is_processing;
+    gboolean device_initialized;
 } AppState;
 
 /**
- * @brief Callback for full-duplex input/output audio.
+ * @brief Update de VU meter.
  */
-static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    AppState *state = (AppState*)pDevice->pUserData;
-    if (!state->is_processing || !pInput || !pOutput) return;
+gboolean update_vu(gpointer user_data) {
+    struct {
+        GtkWidget *bar;
+        float value;
+    } *vu_data = user_data;
 
+    gtk_level_bar_set_value(GTK_LEVEL_BAR(vu_data->bar), vu_data->value);
+    g_free(vu_data);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    typedef struct {
+        GtkWidget *bar;
+        float value;
+    } VuUpdateData;
+    
+    AppState *state = (AppState*)pDevice->pUserData;
+    
+    // Verifica se o processamento está ativo e os ponteiros são válidos.
+    if (!state || !state->is_processing || !pInput || !pOutput || !state->rnnoise_state) {
+        memset(pOutput, 0, frameCount * sizeof(int16_t));  // Silencia a saída.
+        return;
+    }
+    
+    VuUpdateData *vu_data = g_malloc(sizeof(VuUpdateData));
+    
     int16_t *in  = (int16_t*)pInput;
     int16_t *out = (int16_t*)pOutput;
 
@@ -83,8 +110,9 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
         }
     
         // Update the VU meter
-        g_idle_add((GSourceFunc)gtk_level_bar_set_value, state->vu_meter);
-        gtk_level_bar_set_value(GTK_LEVEL_BAR(state->vu_meter), level);
+        vu_data->bar = state->vu_meter;
+        vu_data->value = level;
+        g_idle_add(update_vu, vu_data);
     }
 }    
 
@@ -92,7 +120,10 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
  * @brief Initialize miniaudio.
  */
 static void init_audio_devices(AppState *state) {
+    //ma_backend backends[] = {ma_backend_alsa};
+    //ma_context_init(backends, 1, NULL, &state->context);
     ma_context_init(NULL, 0, NULL, &state->context);
+
     ma_context_get_devices(&state->context,
         &state->playback_infos, &state->playback_count,
         &state->capture_infos, &state->capture_count);
@@ -142,6 +173,8 @@ static void start_processing(AppState *state) {
         return;
     }
 
+    state->device_initialized = TRUE;
+
     if (ma_device_start(&state->device) != MA_SUCCESS) {
         gtk_label_set_text(GTK_LABEL(state->status_label), "Failed to start device");
         ma_device_uninit(&state->device);
@@ -161,12 +194,22 @@ static void start_processing(AppState *state) {
  */
 static void stop_processing(AppState *state) {
     if (state->is_processing) {
-        ma_device_stop(&state->device);
-        ma_device_uninit(&state->device);
-        rnnoise_destroy(state->rnnoise_state);
-        state->rnnoise_state = NULL;
+        if (state->device_initialized && ma_device_is_started(&state->device)) {
+            ma_device_stop(&state->device);
+        }
+    
+        if (state->device_initialized) {
+            ma_device_uninit(&state->device);
+            state->device_initialized = FALSE;
+        }
+    
+        if (state->rnnoise_state) {
+            rnnoise_destroy(state->rnnoise_state);
+            state->rnnoise_state = NULL;
+        }
+    
         state->is_processing = FALSE;
-
+    
         gtk_label_set_text(GTK_LABEL(state->status_label), "Stopped");
         gtk_widget_set_sensitive(state->start_button, TRUE);
         gtk_widget_set_sensitive(state->stop_button, FALSE);
@@ -189,7 +232,11 @@ static void on_stop(GtkWidget *widget, gpointer data) {
 static void on_window_destroy(GtkWidget *widget, gpointer data) {
     AppState *state = (AppState*)data;
     stop_processing(state);
-    ma_context_uninit(&state->context);
+
+    if (state->context.backend != ma_backend_null) {
+        ma_context_uninit(&state->context);
+    }
+
     gtk_main_quit();
 }
 
@@ -201,6 +248,7 @@ int main(int argc, char *argv[]) {
 
     AppState state = {0};
     state.is_processing = FALSE;
+    state.device_initialized = FALSE;
 
     // GUI setup.
     state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
