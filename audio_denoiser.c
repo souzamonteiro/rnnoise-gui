@@ -28,14 +28,15 @@
 #define RNNOISE_FRAME_SIZE 480  // RNNoise processes 480 samples at 48kHz.
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <gtk/gtk.h>
 #include <math.h>
 
-#define FRAME_SIZE 480
-#define SAMPLE_RATE 48000
+#define SAMPLE_RATE 48000 // Sampling rate (48kHz).
+#define FRAME_SIZE 480    // RNNoise frame size (480 samples for 48kHz).
 
 /**
  * Biquad filter structure.
@@ -73,6 +74,8 @@ typedef struct {
     BiquadFilter bandpass_filter2;
 
     DenoiseState *rnnoise_state;
+    int16_t leftover[RNNOISE_FRAME_SIZE];
+    ma_uint32 leftover_count;
 
     // State flags.
     gboolean is_processing;
@@ -183,50 +186,70 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
 
     const int16_t *in = (const int16_t*)pInput;
     int16_t *out = (int16_t*)pOutput;
-    static int16_t mono_buffer[FRAME_SIZE];
-    static float rnnoise_input[RNNOISE_FRAME_SIZE];
-    static float rnnoise_output[RNNOISE_FRAME_SIZE];
+    float float_buffer[FRAME_SIZE];  // Using FRAME_SIZE from your functional code
+    static float first_frame = TRUE; // To skip the first frame like in the original code
 
-    for (ma_uint32 i = 0; i < frameCount; i++) {
-        // Convert stereo to mono.
-        int16_t left = in[i * 2];
-        int16_t right = in[i * 2 + 1];
-        mono_buffer[i] = (int16_t)(((int32_t)left + (int32_t)right) / 2);
+    // Process in blocks of FRAME_SIZE as in your working code
+    for (ma_uint32 i = 0; i < frameCount; i += FRAME_SIZE) {
+        ma_uint32 remaining = frameCount - i;
+        ma_uint32 to_process = (remaining > FRAME_SIZE) ? FRAME_SIZE : remaining;
+
+        // Mix stereo to mono and convert to float.
+        for (ma_uint32 j = 0; j < to_process; j++) {
+            int32_t l = in[(i + j) * 2];
+            int32_t r = in[(i + j) * 2 + 1];
+            float_buffer[j] = (float)((l + r) / 2);  // Mix and directly convert to float.
+        }
+
+        // Fill the remaining frame with zeros if necessary.
+        for (ma_uint32 j = to_process; j < FRAME_SIZE; j++) {
+            float_buffer[j] = 0.0f;
+        }
+
+        if (state->filter_enabled) {
+            // RNNoise processing.
+            rnnoise_process_frame(state->rnnoise_state, float_buffer, float_buffer);
+
+            // Skip the first frame (RNNoise warm-up).
+            if (first_frame) {
+                first_frame = FALSE;
+                continue;
+            }
+
+            // Convert back to int16_t and expand to stereo.
+            for (ma_uint32 j = 0; j < to_process; j++) {
+                float sample = float_buffer[j];
+                // Careful clipping like in your functional code.
+                if (sample > 32767.0f) sample = 32767.0f;
+                if (sample < -32768.0f) sample = -32768.0f;
+                
+                int16_t sample_int = (int16_t)sample;
+                out[(i + j) * 2] = sample_int;
+                out[(i + j) * 2 + 1] = sample_int;
+            }
+        } else {
+            // Bypass if the filter is disabled.
+            for (ma_uint32 j = 0; j < to_process; j++) {
+                int16_t sample = (int16_t)float_buffer[j];
+                out[(i + j) * 2] = sample;
+                out[(i + j) * 2 + 1] = sample;
+            }
+        }
     }
 
-    if (state->filter_enabled) {
-        // Prepare input for RNNoise (convert to float and normalize).
-        for (ma_uint32 i = 0; i < frameCount; i++) {
-            rnnoise_input[i] = mono_buffer[i] / 32768.0f;
-        }
-        
-        // Process with RNNoise.
-        //rnnoise_process_frame(state->rnnoise_state, rnnoise_output, rnnoise_input);
-        
-        // Convert back to int16 and duplicate to stereo.
-        //for (ma_uint32 i = 0; i < frameCount; i++) {
-        //    int16_t sample = (int16_t)(rnnoise_output[i] * 32767.0f);
-        //    out[i * 2] = sample;
-        //    out[i * 2 + 1] = sample;
-        //    mono_buffer[i] = sample; // Update mono buffer for VU meter.
-        //}
-        for (ma_uint32 i = 0; i < frameCount; i++) {
-            out[i * 2] = mono_buffer[i];
-            out[i * 2 + 1] = mono_buffer[i];
-        }
-    } else {
-        // Bypass mode - just copy mono to stereo.
-        for (ma_uint32 i = 0; i < frameCount; i++) {
-            out[i * 2] = mono_buffer[i];
-            out[i * 2 + 1] = mono_buffer[i];
-        }
+    // Update the VU meter with the last processed frame.
+    float volume = 0.0f;
+    for (ma_uint32 i = 0; i < FRAME_SIZE; i++) {
+        volume += float_buffer[i] * float_buffer[i];
     }
+    volume = sqrtf(volume / FRAME_SIZE) / 32768.0f;
 
-    float volume = calculate_rms_volume(mono_buffer, frameCount);
     VuUpdateData* vu_data = g_malloc(sizeof(VuUpdateData));
-    vu_data->vu = state->vu_meter;
-    vu_data->vol = volume;
-    g_idle_add_full(G_PRIORITY_DEFAULT, update_vu_meter, vu_data, NULL);
+    if (vu_data) {
+        vu_data->vu = state->vu_meter;
+        vu_data->vol = volume;
+        g_idle_add_full(G_PRIORITY_DEFAULT, update_vu_meter, vu_data, NULL);
+    }
 }
 
 /**
@@ -245,7 +268,6 @@ static void start_processing(AppState *state) {
         return;
     }
 
-    // Initialize RNNoise.
     state->rnnoise_state = rnnoise_create(NULL);
     if (!state->rnnoise_state) {
         gtk_label_set_text(GTK_LABEL(state->status_label), "Failed to init RNNoise");
@@ -472,6 +494,9 @@ int main(int argc, char *argv[]) {
     // Initialize devices and show window.
     populate_device_lists(&state);
     gtk_widget_show_all(state.window);
+
+    memset(state.leftover, 0, sizeof(state.leftover));
+    state.leftover_count = 0;
 
     gtk_main();
 
