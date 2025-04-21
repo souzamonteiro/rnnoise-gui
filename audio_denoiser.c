@@ -25,7 +25,6 @@
 #include "miniaudio.h"
 
 #include "rnnoise/include/rnnoise.h"
-#define RNNOISE_FRAME_SIZE 480  // RNNoise processes 480 samples at 48kHz.
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -74,9 +73,7 @@ typedef struct {
     BiquadFilter bandpass_filter2;
 
     DenoiseState *rnnoise_state;
-    int16_t leftover[RNNOISE_FRAME_SIZE];
-    ma_uint32 leftover_count;
-
+    
     // State flags.
     gboolean is_processing;
     gboolean filter_enabled;
@@ -186,10 +183,11 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
 
     const int16_t *in = (const int16_t*)pInput;
     int16_t *out = (int16_t*)pOutput;
-    float float_buffer[FRAME_SIZE];  // Using FRAME_SIZE from your functional code
-    static float first_frame = TRUE; // To skip the first frame like in the original code
+    float float_buffer[FRAME_SIZE];
+    float output_buffer[FRAME_SIZE];
+    static bool first_frame = true;  // To skip the first frame.
 
-    // Process in blocks of FRAME_SIZE as in your working code
+    // Process in blocks of FRAME_SIZE.
     for (ma_uint32 i = 0; i < frameCount; i += FRAME_SIZE) {
         ma_uint32 remaining = frameCount - i;
         ma_uint32 to_process = (remaining > FRAME_SIZE) ? FRAME_SIZE : remaining;
@@ -198,57 +196,63 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
         for (ma_uint32 j = 0; j < to_process; j++) {
             int32_t l = in[(i + j) * 2];
             int32_t r = in[(i + j) * 2 + 1];
-            float_buffer[j] = (float)((l + r) / 2);  // Mix and directly convert to float.
+            float_buffer[j] = (float)(l + r / 2);  // Convert the average to float.
         }
 
-        // Fill the remaining frame with zeros if necessary.
+        // Fill the remaining frame with zeros if necessary..
         for (ma_uint32 j = to_process; j < FRAME_SIZE; j++) {
             float_buffer[j] = 0.0f;
         }
 
+        // Calculate volume for VU meter before any early return.
+        float volume = 0.0f;
+        for (ma_uint32 j = 0; j < to_process; j++) {
+            volume += float_buffer[j] * float_buffer[j];
+        }
+        volume = sqrtf(volume / to_process) / 32768.0f;
+
         if (state->filter_enabled) {
             // RNNoise processing.
-            rnnoise_process_frame(state->rnnoise_state, float_buffer, float_buffer);
+            for (ma_uint32 k = 0; k < FRAME_SIZE; k++) {
+                output_buffer[k] = 0.0f;
+            }
+            rnnoise_process_frame(state->rnnoise_state, output_buffer, float_buffer);
 
             // Skip the first frame (RNNoise warm-up).
             if (first_frame) {
-                first_frame = FALSE;
+                first_frame = false;
                 continue;
             }
 
             // Convert back to int16_t and expand to stereo.
             for (ma_uint32 j = 0; j < to_process; j++) {
-                float sample = float_buffer[j];
-                // Careful clipping like in your functional code.
+                float sample = output_buffer[j];
+                // Careful clipping.
                 if (sample > 32767.0f) sample = 32767.0f;
                 if (sample < -32768.0f) sample = -32768.0f;
-                
+
                 int16_t sample_int = (int16_t)sample;
                 out[(i + j) * 2] = sample_int;
                 out[(i + j) * 2 + 1] = sample_int;
             }
         } else {
-            // Bypass if the filter is disabled.
+            // Bypass if the filter is disabled: copy input to output.
             for (ma_uint32 j = 0; j < to_process; j++) {
-                int16_t sample = (int16_t)float_buffer[j];
+                int32_t l = in[(i + j) * 2];
+                int32_t r = in[(i + j) * 2 + 1];
+                int16_t sample = (int16_t)((l + r) / 2);
                 out[(i + j) * 2] = sample;
                 out[(i + j) * 2 + 1] = sample;
             }
         }
-    }
 
-    // Update the VU meter with the last processed frame.
-    float volume = 0.0f;
-    for (ma_uint32 i = 0; i < FRAME_SIZE; i++) {
-        volume += float_buffer[i] * float_buffer[i];
-    }
-    volume = sqrtf(volume / FRAME_SIZE) / 32768.0f;
-
-    VuUpdateData* vu_data = g_malloc(sizeof(VuUpdateData));
-    if (vu_data) {
-        vu_data->vu = state->vu_meter;
-        vu_data->vol = volume;
-        g_idle_add_full(G_PRIORITY_DEFAULT, update_vu_meter, vu_data, NULL);
+        // Update the VU meter with the last processed block.
+        VuUpdateData* vu_data = g_malloc(sizeof(VuUpdateData));
+        if (vu_data) {
+            vu_data->vu = state->vu_meter;
+            vu_data->vol = volume;
+            g_idle_add_full(G_PRIORITY_DEFAULT, update_vu_meter, vu_data, NULL);
+        }
     }
 }
 
@@ -494,9 +498,6 @@ int main(int argc, char *argv[]) {
     // Initialize devices and show window.
     populate_device_lists(&state);
     gtk_widget_show_all(state.window);
-
-    memset(state.leftover, 0, sizeof(state.leftover));
-    state.leftover_count = 0;
 
     gtk_main();
 
