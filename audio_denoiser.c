@@ -34,8 +34,9 @@
 #include <gtk/gtk.h>
 #include <math.h>
 
-#define SAMPLE_RATE 48000       // Sampling rate (48kHz).
-#define RNNOISE_FRAME_SIZE 480  // RNNoise frame size (480 samples for 48kHz).
+#define SAMPLE_RATE 48000            // Sampling rate (48kHz).
+#define RNNOISE_FRAME_SIZE 480       // RNNoise frame size (480 samples for 48kHz).
+#define RNNOISE_NUMBER_OF_FRAMES 10  // RNNoise buffer size.
 
 /**
  * Biquad filter structure.
@@ -73,6 +74,8 @@ typedef struct {
     BiquadFilter bandpass_filter2;
 
     DenoiseState *rnnoise_state;
+    float rnnoise_buffer[RNNOISE_FRAME_SIZE * RNNOISE_NUMBER_OF_FRAMES];
+    int rnnoise_frame_count; // Number of frames currently in the buffer.
     
     // State flags.
     gboolean is_processing;
@@ -173,62 +176,74 @@ static float biquad_process(BiquadFilter* f, float in) {
  * @param pInput Pointer to input buffer.
  * @param frameCount Number of frames to process.
  */
-static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    AppState *state = (AppState*)pDevice->pUserData;
-
-    if (!state || !state->is_processing || !pInput || !pOutput) {
-        memset(pOutput, 0, frameCount * 2 * sizeof(int16_t));
-        return;
-    }
-
-    const int16_t *in = (const int16_t*)pInput;
-    int16_t *out = (int16_t*)pOutput;
-
-    for (ma_uint32 i = 0; i < frameCount; i += RNNOISE_FRAME_SIZE) {
-        ma_uint32 remaining = frameCount - i;
-        ma_uint32 to_process = (remaining > RNNOISE_FRAME_SIZE) ? RNNOISE_FRAME_SIZE : remaining;
-
-        float volume = 0.0f;
-
-        float buffer[RNNOISE_FRAME_SIZE] = {0};
-
-        // Convert PCM to float.
-        for (ma_uint32 j = 0; j < to_process; ++j) {
-            int32_t l = in[(i + j) * 2];
-            int32_t r = in[(i + j) * 2 + 1];
-            int16_t mono = (int16_t)((l + r) / 2);
-            buffer[j] = (float)mono;
-
-            volume += l * r;
+// In duplex_callback:
+static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) { 
+    AppState *state = (AppState*)pDevice->pUserData; 
+    
+    if (!state || !state->is_processing) { 
+        memset(pOutput, 0, frameCount * 2 * sizeof(int16_t)); 
+        return; 
+    } 
+    
+    const int16_t *in = (const int16_t*)pInput; 
+    int16_t *out = (int16_t*)pOutput; 
+    
+    for (ma_uint32 i = 0; i < frameCount; i += RNNOISE_FRAME_SIZE) { 
+        ma_uint32 to_process = MIN(RNNOISE_FRAME_SIZE, frameCount - i); 
+        float volume = 0.0f; 
+        
+        // Convert to float and add to buffer.
+        for (ma_uint32 j = 0; j < to_process; j++) { 
+            float sample = (in[(i + j) * 2] + in[(i + j) * 2 + 1]) / 65536.0f; 
+            state->rnnoise_buffer[state->rnnoise_frame_count * RNNOISE_FRAME_SIZE + j] = sample; 
+            volume += fabsf(sample); 
         }
-
-        // Zero padding for last frame.
-        for (size_t j = to_process; j < RNNOISE_FRAME_SIZE; j++) {
-            buffer[j] = 0.0f;
+        
+        // Zero-pad if necessary.
+        for (ma_uint32 j = to_process; j < RNNOISE_FRAME_SIZE; j++) {
+            state->rnnoise_buffer[state->rnnoise_frame_count * RNNOISE_FRAME_SIZE + j] = 0.0f;
         }
-
-        volume = sqrtf(volume / to_process) / 32768.0f;
-
-        if (state->filter_enabled) {
-            // Apply RNNoise.
-            rnnoise_process_frame(state->rnnoise_state, buffer, buffer);
-
-            // Convert float back to PCM.
-            for (ma_uint32 j = 0; j < to_process; ++j) {
-                int16_t sample = (int16_t)buffer[j];
-                out[(i + j) * 2] = sample;
-                out[(i + j) * 2 + 1] = sample;
+        
+        state->rnnoise_frame_count++;
+        volume = volume / RNNOISE_FRAME_SIZE; // Average volume.
+        
+        // When we have enough frames, process.
+        if (state->rnnoise_frame_count == RNNOISE_NUMBER_OF_FRAMES) {
+            float process_buffer[RNNOISE_FRAME_SIZE];
+            
+            // Process each frame individually but with context of the others.
+            for (int f = 0; f < RNNOISE_NUMBER_OF_FRAMES; f++) {
+                // Copy frame to processing buffer.
+                memcpy(process_buffer, &state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE], RNNOISE_FRAME_SIZE * sizeof(float));
+                
+                // Apply RNNoise.
+                rnnoise_process_frame(state->rnnoise_state, process_buffer, process_buffer);
+                
+                // Copy back (overwriting with processed audio).
+                memcpy(&state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE],process_buffer,RNNOISE_FRAME_SIZE * sizeof(float));
             }
-        } else {
-            for (ma_uint32 j = 0; j < to_process; ++j) {
-                int32_t l = in[(i + j) * 2];
-                int32_t r = in[(i + j) * 2 + 1];
-                int16_t sample = (int16_t)((l + r) / 2);
-                out[(i + j) * 2] = sample;
-                out[(i + j) * 2 + 1] = sample;
-            }
-        }
-
+            
+            // Write all processed frames to the output.
+            for (int f = 0; f < RNNOISE_NUMBER_OF_FRAMES; f++) {
+                for (int j = 0; j < RNNOISE_FRAME_SIZE; j++) {
+                    float sample = state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE + j];
+                    int16_t pcm_sample = (int16_t)(sample * 32767.0f);
+                    
+                    // Find the correct position in the output.
+                    uint32_t out_pos = i + (f * RNNOISE_FRAME_SIZE) + j;
+                    if (out_pos < frameCount) {
+                        out[out_pos * 2] = pcm_sample;
+                        out[out_pos * 2 + 1] = pcm_sample;
+                    }
+                }
+            } 
+            
+            // Reset buffer.
+            state->rnnoise_frame_count = 0;
+            memset(state->rnnoise_buffer, 0, sizeof(state->rnnoise_buffer));
+        } 
+        
+        // Update VU meter.
         VuUpdateData* vu_data = g_malloc(sizeof(VuUpdateData));
         if (vu_data) {
             vu_data->vu = state->vu_meter;
@@ -259,6 +274,11 @@ static void start_processing(AppState *state) {
         gtk_label_set_text(GTK_LABEL(state->status_label), "Failed to init RNNoise");
         return;
     }
+
+    for (size_t i = 0; i < RNNOISE_FRAME_SIZE * RNNOISE_NUMBER_OF_FRAMES; i++) {
+        state->rnnoise_buffer[i] = 0.0f;
+    }
+    state->rnnoise_frame_count = 0;
 
     ma_device_config config = ma_device_config_init(ma_device_type_duplex);
     config.sampleRate = SAMPLE_RATE;
