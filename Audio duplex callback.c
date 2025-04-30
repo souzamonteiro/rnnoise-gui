@@ -15,14 +15,15 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
 
     const int16_t *in = (const int16_t*)pInput;
     int16_t *out = (int16_t*)pOutput;
-    float float_buffer[FRAME_SIZE];
-    float output_buffer[FRAME_SIZE];
+    float float_buffer[RNNOISE_FRAME_SIZE];
+    float output_buffer[RNNOISE_FRAME_SIZE];
     static bool first_frame = true;  // To skip the first frame.
 
-    // Process in blocks of FRAME_SIZE.
-    for (ma_uint32 i = 0; i < frameCount; i += FRAME_SIZE) {
+    // Process in blocks of RNNOISE_FRAME_SIZE.
+    for (ma_uint32 i = 0; i < frameCount; i += RNNOISE_FRAME_SIZE) {
+        //printf("Frame count: %d, frame number: %d\n", frameCount, i);
         ma_uint32 remaining = frameCount - i;
-        ma_uint32 to_process = (remaining > FRAME_SIZE) ? FRAME_SIZE : remaining;
+        ma_uint32 to_process = (remaining > RNNOISE_FRAME_SIZE) ? RNNOISE_FRAME_SIZE : remaining;
 
         // Mix stereo to mono and convert to float.
         for (ma_uint32 j = 0; j < to_process; j++) {
@@ -32,11 +33,11 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
         }
 
         // Fill the remaining frame with zeros if necessary..
-        for (ma_uint32 j = to_process; j < FRAME_SIZE; j++) {
+        for (ma_uint32 j = to_process; j < RNNOISE_FRAME_SIZE; j++) {
             float_buffer[j] = 0.0f;
         }
 
-        // Calculate volume for VU meter before any early return.
+        // Calculate volumeRNNOISE_FRAME_SIZE for VU meter before any early return.
         float volume = 0.0f;
         for (ma_uint32 j = 0; j < to_process; j++) {
             volume += float_buffer[j] * float_buffer[j];
@@ -45,10 +46,11 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
 
         if (state->filter_enabled) {
             // RNNoise processing.
-            for (ma_uint32 k = 0; k < FRAME_SIZE; k++) {
+            for (ma_uint32 k = 0; k < RNNOISE_FRAME_SIZE; k++) {
                 output_buffer[k] = 0.0f;
             }
             rnnoise_process_frame(state->rnnoise_state, output_buffer, float_buffer);
+            //memcpy(output_buffer, float_buffer, RNNOISE_FRAME_SIZE * sizeof(float));
 
             // Skip the first frame (RNNoise warm-up).
             if (first_frame) {
