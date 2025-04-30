@@ -223,6 +223,16 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
                 memcpy(&state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE],process_buffer,RNNOISE_FRAME_SIZE * sizeof(float));
             }
             
+            // Overlap-and-add.
+            #define OVERLAP_FACTOR 2  // 50% of overlap.
+            for (int f = 0; f < RNNOISE_NUMBER_OF_FRAMES - 1; f++) {
+                int overlap_start = (RNNOISE_FRAME_SIZE / OVERLAP_FACTOR);
+                for (int j = overlap_start; j < RNNOISE_FRAME_SIZE; j++) {
+                    float alpha = (float)(j - overlap_start) / (RNNOISE_FRAME_SIZE - overlap_start);
+                    state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE + j] = state->rnnoise_buffer[f * RNNOISE_FRAME_SIZE + j] * (1 - alpha) + state->rnnoise_buffer[(f + 1) * RNNOISE_FRAME_SIZE + (j - overlap_start)] * alpha;
+                }
+            }
+
             // Write all processed frames to the output.
             for (int f = 0; f < RNNOISE_NUMBER_OF_FRAMES; f++) {
                 for (int j = 0; j < RNNOISE_FRAME_SIZE; j++) {
