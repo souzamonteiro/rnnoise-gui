@@ -183,72 +183,72 @@ static void duplex_callback(ma_device* pDevice, void* pOutput, const void* pInpu
 
     const int16_t *in = (const int16_t*)pInput;
     int16_t *out = (int16_t*)pOutput;
-    
-    // Buffer increased for smoothing.
-    #define HISTORY_FRAMES 3
-    static float history[HISTORY_FRAMES][RNNOISE_FRAME_SIZE] = {0};
-    static int history_pos = 0;
-    
-    float current_frame[RNNOISE_FRAME_SIZE];
-    float processed_frame[RNNOISE_FRAME_SIZE];
+    float float_buffer[RNNOISE_FRAME_SIZE];
+    float output_buffer[RNNOISE_FRAME_SIZE];
+    static bool first_frame = true;  // To skip the first frame.
 
+    // Process in blocks of RNNOISE_FRAME_SIZE.
     for (ma_uint32 i = 0; i < frameCount; i += RNNOISE_FRAME_SIZE) {
-        ma_uint32 to_process = MIN(RNNOISE_FRAME_SIZE, frameCount - i);
-        float volume = 0.0f;
+        //printf("Frame count: %d, frame number: %d\n", frameCount, i);
+        ma_uint32 remaining = frameCount - i;
+        ma_uint32 to_process = (remaining > RNNOISE_FRAME_SIZE) ? RNNOISE_FRAME_SIZE : remaining;
 
-        // Convert to float with correct normalization (-1.0 to 1.0).
+        // Mix stereo to mono and convert to float.
         for (ma_uint32 j = 0; j < to_process; j++) {
             int32_t l = in[(i + j) * 2];
             int32_t r = in[(i + j) * 2 + 1];
-            current_frame[j] = (l + r) / 65536.0f;  // Divide by 32768 * 2.
-            volume += fabsf(current_frame[j]);
-        }
-        
-        // Pad with zeros if necessary.
-        for (ma_uint32 j = to_process; j < RNNOISE_FRAME_SIZE; j++) {
-            current_frame[j] = 0.0f;
+            float_buffer[j] = (float)(l + r / 2);  // Convert the average to float.
         }
 
-        volume /= RNNOISE_FRAME_SIZE;  // Average volume.
+        // Fill the remaining frame with zeros if necessary..
+        for (ma_uint32 j = to_process; j < RNNOISE_FRAME_SIZE; j++) {
+            float_buffer[j] = 0.0f;
+        }
+
+        // Calculate volumeRNNOISE_FRAME_SIZE for VU meter before any early return.
+        float volume = 0.0f;
+        for (ma_uint32 j = 0; j < to_process; j++) {
+            volume += float_buffer[j] * float_buffer[j];
+        }
+        volume = sqrtf(volume / to_process) / 32768.0f;
 
         if (state->filter_enabled) {
-            // Process with RNNoise
-            rnnoise_process_frame(state->rnnoise_state, processed_frame, current_frame);
-            
-            float vocal_boost = 1.2f;  // Adjust as necessary.
-            for (ma_uint32 j = 0; j < RNNOISE_FRAME_SIZE; j++) {
-                processed_frame[j] *= vocal_boost;
+            // RNNoise processing.
+            for (ma_uint32 k = 0; k < RNNOISE_FRAME_SIZE; k++) {
+                output_buffer[k] = 0.0f;
+            }
+            rnnoise_process_frame(state->rnnoise_state, output_buffer, float_buffer);
+            //memcpy(output_buffer, float_buffer, RNNOISE_FRAME_SIZE * sizeof(float));
+
+            // Skip the first frame (RNNoise warm-up).
+            if (first_frame) {
+                first_frame = false;
+                continue;
             }
 
-            // Temporal smoothing: blend with previous frames.
-            for (ma_uint32 j = 0; j < RNNOISE_FRAME_SIZE; j++) {
-                processed_frame[j] = 0.6f * processed_frame[j] + 
-                                   0.3f * history[(history_pos + 1) % HISTORY_FRAMES][j] + 
-                                   0.1f * history[(history_pos + 2) % HISTORY_FRAMES][j];
-            }
-            
-            // Update history.
-            memcpy(history[history_pos], processed_frame, sizeof(processed_frame));
-            history_pos = (history_pos + 1) % HISTORY_FRAMES;
-            
-            // Convert to PCM with careful thresholding.
+            // Convert back to int16_t and expand to stereo.
             for (ma_uint32 j = 0; j < to_process; j++) {
-                float sample = processed_frame[j];
-                sample = fmaxf(-0.9999f, fminf(0.9999f, sample));  // Avoid clipping.
-                int16_t sample_int = (int16_t)(sample * 32767.0f);
+                float sample = output_buffer[j];
+                // Careful clipping.
+                if (sample > 32767.0f) sample = 32767.0f;
+                if (sample < -32768.0f) sample = -32768.0f;
+
+                int16_t sample_int = (int16_t)sample;
                 out[(i + j) * 2] = sample_int;
                 out[(i + j) * 2 + 1] = sample_int;
             }
         } else {
-            // Bypass.
+            // Bypass if the filter is disabled: copy input to output.
             for (ma_uint32 j = 0; j < to_process; j++) {
-                int16_t sample = (int16_t)((in[(i + j) * 2] + in[(i + j) * 2 + 1]) / 2);
+                int32_t l = in[(i + j) * 2];
+                int32_t r = in[(i + j) * 2 + 1];
+                int16_t sample = (int16_t)((l + r) / 2);
                 out[(i + j) * 2] = sample;
                 out[(i + j) * 2 + 1] = sample;
             }
         }
 
-        // Update VU meter.
+        // Update the VU meter with the last processed block.
         VuUpdateData* vu_data = g_malloc(sizeof(VuUpdateData));
         if (vu_data) {
             vu_data->vu = state->vu_meter;
@@ -286,6 +286,8 @@ static void start_processing(AppState *state) {
     config.capture.channels = 2;
     config.playback.format = ma_format_s16;
     config.playback.channels = 2;
+    config.periodSizeInFrames = 480;
+    config.periods = 4;
     config.dataCallback = duplex_callback;
     config.pUserData = state;
 
